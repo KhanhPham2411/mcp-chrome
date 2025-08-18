@@ -43,6 +43,7 @@ export default defineConfig({
       'bookmarks',
       'offscreen',
       'storage',
+      'cookies',
     ],
     host_permissions: ['<all_urls>'],
     web_accessible_resources: [

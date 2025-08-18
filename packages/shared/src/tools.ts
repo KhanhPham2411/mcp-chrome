@@ -25,6 +25,7 @@ export const TOOL_NAMES = {
     INJECT_SCRIPT: 'chrome_inject_script',
     SEND_COMMAND_TO_INJECT_SCRIPT: 'chrome_send_command_to_inject_script',
     CONSOLE: 'chrome_console',
+    GET_COOKIE: 'chrome_get_cookie',
   },
 };
 
@@ -532,6 +533,20 @@ export const TOOL_SCHEMAS: Tool[] = [
         },
       },
       required: [],
+    },
+  },
+  {
+    name: TOOL_NAMES.BROWSER.GET_COOKIE,
+    description: 'Get all cookies from a specified website',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'URL of the website to get cookies from (e.g., "https://example.com")',
+        },
+      },
+      required: ['url'],
     },
   },
 ];
