@@ -10,7 +10,7 @@ const {
 } = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
 
 // Configuration
-const PORT = 8080;
+const PORT = 12307;
 const MCP_SERVER_URL = 'http://127.0.0.1:12306/mcp';
 
 // MCP client instance
