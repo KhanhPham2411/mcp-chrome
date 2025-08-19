@@ -13,13 +13,41 @@ const {
 const PORT = 12307;
 const MCP_SERVER_URL = 'http://127.0.0.1:12306/mcp';
 
-// MCP client instance
+// MCP client instance and state management
 let mcpClient = null;
+let isInitializing = false;
+let isConnected = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY = 2000; // 2 seconds
 
 // Initialize MCP client
 async function initializeMcpClient() {
+  // Prevent multiple simultaneous initializations
+  if (isInitializing) {
+    console.log('MCP client initialization already in progress, skipping...');
+    return false;
+  }
+
+  if (isConnected && mcpClient) {
+    console.log('MCP client already connected, skipping initialization...');
+    return true;
+  }
+
+  isInitializing = true;
+
   try {
     console.log('Initializing MCP client...');
+
+    // Close existing client if it exists
+    if (mcpClient) {
+      try {
+        await mcpClient.close();
+      } catch (closeError) {
+        console.log('Error closing existing client:', closeError.message);
+      }
+      mcpClient = null;
+    }
 
     mcpClient = new Client(
       {
@@ -34,18 +62,69 @@ async function initializeMcpClient() {
     const transport = new StreamableHTTPClientTransport(new URL(MCP_SERVER_URL), {});
     await mcpClient.connect(transport);
 
+    isConnected = true;
+    reconnectAttempts = 0;
     console.log('MCP client connected successfully');
+
+    // Set up connection monitoring
+    setupConnectionMonitoring();
+
     return true;
   } catch (error) {
     console.error('Failed to initialize MCP client:', error);
+    isConnected = false;
+
+    // Attempt reconnection if we haven't exceeded max attempts
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      console.log(
+        `Reconnection attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS} in ${RECONNECT_DELAY}ms...`,
+      );
+      setTimeout(() => {
+        reconnectAttempts++;
+        initializeMcpClient();
+      }, RECONNECT_DELAY);
+    } else {
+      console.error('Max reconnection attempts reached. Manual intervention required.');
+    }
+
     return false;
+  } finally {
+    isInitializing = false;
   }
+}
+
+// Monitor connection health and reconnect if needed
+function setupConnectionMonitoring() {
+  if (!mcpClient) return;
+
+  // Check connection health every 30 seconds
+  const healthCheckInterval = setInterval(async () => {
+    if (!mcpClient || !isConnected) {
+      clearInterval(healthCheckInterval);
+      return;
+    }
+
+    try {
+      // Send a simple ping to check if connection is alive
+      await mcpClient.sendRequest({
+        jsonrpc: '2.0',
+        id: 'health-check',
+        method: 'ping',
+        params: {},
+      });
+    } catch (error) {
+      console.log('Connection health check failed, attempting reconnection...');
+      isConnected = false;
+      clearInterval(healthCheckInterval);
+      await initializeMcpClient();
+    }
+  }, 30000);
 }
 
 // Send request to MCP server using proper client
 async function sendToMcpServer(message) {
-  if (!mcpClient) {
-    throw new Error('MCP client not initialized');
+  if (!mcpClient || !isConnected) {
+    throw new Error('MCP client not initialized or not connected');
   }
 
   try {
@@ -68,6 +147,16 @@ async function sendToMcpServer(message) {
       return result;
     }
   } catch (error) {
+    // If we get a connection error, try to reconnect
+    if (error.message.includes('connection') || error.message.includes('closed')) {
+      console.log('Connection error detected, attempting reconnection...');
+      isConnected = false;
+      await initializeMcpClient();
+      // Retry the request once after reconnection
+      if (isConnected && mcpClient) {
+        return await sendToMcpServer(message);
+      }
+    }
     throw new Error(`MCP client error: ${error.message}`);
   }
 }
@@ -98,7 +187,13 @@ const server = http.createServer(async (req, res) => {
         timestamp: new Date().toISOString(),
         message: 'HTTP Wrapper Server is running',
         mcpServerUrl: MCP_SERVER_URL,
-        mcpClientReady: mcpClient !== null,
+        mcpClientReady: mcpClient !== null && isConnected,
+        connectionStatus: {
+          isConnected,
+          isInitializing,
+          reconnectAttempts,
+          maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+        },
         note: 'Connects directly to MCP server using MCP client',
       }),
     );
@@ -125,12 +220,17 @@ const server = http.createServer(async (req, res) => {
 
           console.log(`Get cookie request for URL: ${targetUrl}`);
 
-          if (!mcpClient) {
+          if (!mcpClient || !isConnected) {
             res.writeHead(503, { 'Content-Type': 'application/json' });
             res.end(
               JSON.stringify({
                 error: 'MCP client not ready',
                 message: 'Please wait for MCP client initialization',
+                status: {
+                  isConnected,
+                  isInitializing,
+                  reconnectAttempts,
+                },
               }),
             );
             return;
@@ -202,7 +302,12 @@ const server = http.createServer(async (req, res) => {
               url: 'string - URL of the website to get cookies from',
             },
             note: 'Connects directly to MCP server using MCP client at ' + MCP_SERVER_URL,
-            status: mcpClient ? 'ready' : 'initializing',
+            status: mcpClient && isConnected ? 'ready' : 'initializing',
+            connectionInfo: {
+              isConnected,
+              isInitializing,
+              reconnectAttempts,
+            },
           },
         ],
       }),
@@ -233,10 +338,14 @@ server.listen(PORT, async () => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\nShutting down...');
   if (mcpClient) {
-    mcpClient.close();
+    try {
+      await mcpClient.close();
+    } catch (error) {
+      console.log('Error closing MCP client:', error.message);
+    }
   }
   server.close(() => {
     console.log('HTTP server closed');
@@ -244,13 +353,28 @@ process.on('SIGINT', () => {
   });
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('\nShutting down...');
   if (mcpClient) {
-    mcpClient.close();
+    try {
+      await mcpClient.close();
+    } catch (error) {
+      console.log('Error closing MCP client:', error.message);
+    }
   }
   server.close(() => {
     console.log('HTTP server closed');
     process.exit(0);
   });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Don't exit, just log the error
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit, just log the error
 });
